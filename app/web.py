@@ -9,7 +9,6 @@ import secrets
 import sqlite3
 import threading
 import time
-from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 from flask import (
@@ -22,7 +21,6 @@ from flask import (
 )
 
 from .reducer import (
-    ERROR,
     ProbeOutcome,
     ReductionResult,
     UnsafeScriptError,
@@ -98,6 +96,9 @@ def _outcome_dict(outcome: Optional[ProbeOutcome]) -> Optional[dict]:
         "message": outcome.message,
         "duration": round(outcome.duration, 4),
         "n_rows": outcome.n_rows,
+        # Diagnostic only (e.g. a crashed worker's stderr).  It is not
+        # part of the error and plays no role in reproduction matching.
+        "detail": outcome.detail,
     }
 
 
@@ -120,6 +121,8 @@ def create_app() -> Flask:
 
     def _worker(job_id: str, baseline_path: str, rows, script: str) -> None:
         events: List[dict] = []
+        with jobs_lock:
+            job = jobs[job_id]
 
         def report(event: dict) -> None:
             event = dict(event)
@@ -134,8 +137,6 @@ def create_app() -> Flask:
                     "current_size": event["current_size"],
                 }
 
-        with jobs_lock:
-            job = jobs[job_id]
         try:
             result: ReductionResult = reduce_batch(
                 baseline_path,

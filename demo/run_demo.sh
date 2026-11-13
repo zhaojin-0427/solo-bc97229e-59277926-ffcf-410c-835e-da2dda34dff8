@@ -66,11 +66,13 @@ J2=$(submit "${HERE}/unique_duplicate")
 J3=$(submit "${HERE}/success_batch")
 J4=$(submit "${HERE}/empty_reproduces")
 J5=$(submit "${HERE}/timeout_probe")
+J6=$(submit "${HERE}/glob_backtrack")
 
 show "CHECK 约束（40 行 → 1 行）"      "$J1" "reduced / 1 行 [S-BAD, N/A]"
 show "UNIQUE 主键冲突（最小 2 行）"   "$J2" "reduced / 2 行重复 sample_id"
 show "原批成功（不缩减）"             "$J3" "no_error"
 show "空样本即报同错（不缩减）"       "$J4" "empty_reproduces"
 show "探测超时（未完成）"             "$J5" "incomplete_timeout"
+show "GLOB 回溯无法中断（2 秒终止，未完成）" "$J6" "incomplete_timeout / 保留目标错误 / 无下载"
 
 echo "演示完成。浏览器打开 ${BASE_URL}/ 可查看图形界面与下载入口。"

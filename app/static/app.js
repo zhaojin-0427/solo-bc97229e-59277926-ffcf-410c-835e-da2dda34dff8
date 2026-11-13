@@ -15,8 +15,8 @@
     reduced: "已缩减（最小复现样本）",
     no_error: "原批成功，无目标错误，不缩减",
     empty_reproduces: "空样本即报同错，与数据行无关，不缩减",
-    incomplete_timeout: "未完成：存在超时探测",
-    failed: "失败",
+    incomplete_timeout: "未完成：存在超时探测（不提供样本）",
+    failed: "失败（未能复现目标错误，不提供样本）",
   };
 
   function $(id) { return document.getElementById(id); }
@@ -45,12 +45,27 @@
         outcome.n_rows + " 行"));
       return;
     }
+    if (outcome.kind === "crash") {
+      box.classList.add("error");
+      box.appendChild(el("div", null,
+        "⚠ 探测进程异常结束（不作为目标错误或最小性证据）"));
+      box.appendChild(el("div", null, "耗时 " + outcome.duration + "s · " +
+        outcome.n_rows + " 行"));
+      if (outcome.detail) {
+        box.appendChild(el("pre", { "class": "detail" }, outcome.detail));
+      }
+      return;
+    }
     if (outcome.kind === "timeout") {
       box.classList.add("timeout");
       box.appendChild(el("div", null, "⏱ 超时（已强制终止实际执行，" +
         "不作为目标错误或最小性证据）"));
       box.appendChild(el("div", null, "耗时 " + outcome.duration + "s · " +
         outcome.n_rows + " 行"));
+      if (outcome.detail) {
+        var detail = el("pre", { "class": "detail" }, outcome.detail);
+        box.appendChild(detail);
+      }
       return;
     }
     box.classList.add("error");

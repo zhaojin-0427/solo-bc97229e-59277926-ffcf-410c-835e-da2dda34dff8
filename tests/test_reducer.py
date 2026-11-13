@@ -3,6 +3,7 @@
 import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 import unittest
@@ -11,7 +12,6 @@ from app.reducer import (
     ERROR,
     SUCCESS,
     TIMEOUT,
-    ProbeTimeout,
     UnsafeScriptError,
     is_reproduction,
     reduce_batch,
@@ -50,6 +50,31 @@ WITH RECURSIVE cnt(x) AS (
 )
 SELECT count(*) FROM cnt;
 """
+
+# Regression: a pathological but perfectly legal GLOB pattern.  SQLite's
+# GLOB matcher backtracks within one C-level VM opcode, so neither the
+# progress handler nor Connection.interrupt() can stop it.  The script
+# first inserts into a sample_id-unique result table (raising the target
+# UNIQUE error), then scans with the slow pattern.  A single-row candidate
+# (`sample_id` A, a 120k-character reading of 'a's) is where the old
+# in-process probe used to overrun its 2-second budget.
+GLOB_BACKTRACK_PATTERN = "*" + "a" * 49000 + "b"
+
+
+def glob_backtrack_sql(pattern=GLOB_BACKTRACK_PATTERN):
+    return f"""\
+DROP TABLE IF EXISTS result_table;
+CREATE TABLE result_table (sample_id TEXT PRIMARY KEY, reading TEXT);
+INSERT INTO result_table (sample_id, reading)
+SELECT sample_id, reading FROM staging ORDER BY rowid;
+SELECT count(*) FROM result_table WHERE reading GLOB '{pattern}';
+"""
+
+
+GLOB_BACKTRACK_ROWS = [
+    ("S1", "a" * 120000),
+    ("S1", "b" * 120000),
+]
 
 
 class ReducerTestBase(unittest.TestCase):
@@ -176,7 +201,108 @@ class TimeoutTests(ReducerTestBase):
         self.assertLess(elapsed, 6.0)
         self.assertGreaterEqual(result.target.duration, 1.8)
         self.assertLess(result.target.duration, 3.5)
+
+    def test_hard_deadline_kills_non_interruptible_glob_scan(self):
+        # A catastrophic GLOB match cannot be stopped by a progress
+        # handler or Connection.interrupt(); the probe must still be cut
+        # at the 2s deadline by terminating the worker process.  The
+        # single-row candidate is the case the old implementation hung on.
+        t0 = time.monotonic()
+        outcome = run_probe(
+            self.baseline, [GLOB_BACKTRACK_ROWS[0]], glob_backtrack_sql(),
+            probe_timeout=2.0,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(outcome.kind, TIMEOUT)
+        self.assertIsNone(outcome.error_code)
+        self.assertFalse(is_reproduction(outcome, outcome))
+        # Real execution stopped at ~2s (small allowance for process
+        # spawn + SIGTERM/SIGKILL), nowhere near the ~11s the scan needs.
+        self.assertGreaterEqual(outcome.duration, 1.8)
+        self.assertLess(outcome.duration, 3.5)
+        self.assertLess(elapsed, 3.8)
+        self.assertBaselineUntouched()
+
+    def test_failed_final_verification_is_not_reported_as_timeout(self):
+        # If the returned candidate stops reproducing the target error at
+        # the final independent check (e.g. a non-deterministic script),
+        # the run is `failed`, never `incomplete_timeout` -- and no sample
+        # is returned.  The branch is exercised by making the shared
+        # reproduction predicate disagree after the target is established
+        # (exactly what a non-deterministic script would cause).
+        from unittest import mock
+
+        import app.reducer as reducer_module
+
+        rows = [("BAD", "x"), ("A", "1"), ("B", "2")]
+        real_is_repro = reducer_module.is_reproduction
+        calls = {"n": 0}
+
+        def flaky(outcome, target):
+            calls["n"] += 1
+            # First call establishes the target as a true reproduction.
+            return real_is_repro(outcome, target) if calls["n"] <= 1 else False
+
+        with mock.patch.object(reducer_module, "is_reproduction", flaky):
+            result = reduce_batch(self.baseline, rows, CHECK_SQL)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reduced_rows, [])
+        self.assertIn("未能复现", result.note)
+        self.assertEqual(result.probe_timeout_count, 0)
+        self.assertBaselineUntouched()
+
+    def test_worker_crash_is_not_reported_as_timeout(self):
+        # If the probe worker dies without publishing a result (a crash,
+        # not a deadline), the outcome is `crash` -- an inconclusive
+        # result that is never mistaken for the target error, for a
+        # timeout, or for minimality evidence.
+        from unittest import mock
+
+        import app.reducer as reducer_module
+
+        broken = os.path.join(self.tmp, "broken_worker.py")
+        with open(broken, "w") as fh:
+            fh.write("import sys; sys.stderr.write('boom\\n'); sys.exit(3)\n")
+
+        with mock.patch.object(reducer_module, "_WORKER_SCRIPT", broken):
+            outcome = run_probe(
+                self.baseline, [("A", "1")], "SELECT 1;", probe_timeout=2.0
+            )
+            result = reduce_batch(
+                self.baseline, [("A", "1"), ("B", "2")], "SELECT 1;",
+                probe_timeout=2.0,
+            )
+
+        self.assertEqual(outcome.kind, "crash")
+        self.assertNotEqual(outcome.kind, TIMEOUT)
+        self.assertIsNone(outcome.error_code)
+        self.assertIn("boom", outcome.detail or "")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reduced_rows, [])
+        self.assertBaselineUntouched()
+
+    def test_glob_backtrack_job_stops_at_deadline_and_keeps_target_error(self):
+        # The reported scenario end-to-end: the full batch fails fast with
+        # a real UNIQUE error (same sample_id, first reading of 120k 'a's),
+        # but any single-row candidate runs the slow GLOB scan.  Reduction
+        # must terminate at the deadline, report incomplete, keep the
+        # already-established target error, and return no sample.
+        t0 = time.monotonic()
+        result = reduce_batch(
+            self.baseline, GLOB_BACKTRACK_ROWS, glob_backtrack_sql(),
+            probe_timeout=2.0,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(result.status, "incomplete_timeout")
+        self.assertGreaterEqual(result.probe_timeout_count, 1)
+        self.assertEqual(result.reduced_rows, [])
+        # The target error was obtained before the timeout and is retained.
+        self.assertEqual(result.target.kind, ERROR)
+        self.assertEqual(result.target.error_code, 1555)  # PRIMARY KEY
         self.assertIn("未完成", result.note)
+        # Terminating each probe at 2s bounds the whole job.
+        self.assertLess(elapsed, 8.0)
         self.assertBaselineUntouched()
 
     def test_run_probe_returns_timeout_not_error(self):
@@ -344,6 +470,65 @@ class ScriptSafetyTests(ReducerTestBase):
         self.assertEqual(results["a"].reduced_rows, [("BAD", "x")])
         self.assertEqual(results["b"].status, "reduced")
         self.assertEqual(results["b"].reduced_rows, [("K", "1"), ("K", "2")])
+        self.assertBaselineUntouched()
+
+    def test_slow_glob_probe_does_not_block_concurrent_normal_job(self):
+        # Regression: a probing job that will hit the hard deadline must
+        # not starve a normal reduction running at the same time, and the
+        # normal job must still produce exactly its correct minimal sample.
+        import threading
+
+        normal_rows = [("U1", "10"), ("U2", "20"), ("U1", "30"), ("U3", "40")]
+        slow_rows = GLOB_BACKTRACK_ROWS
+        outcome = {}
+
+        def run_slow():
+            t0 = time.monotonic()
+            outcome["slow"] = reduce_batch(
+                self.baseline, slow_rows, glob_backtrack_sql(), probe_timeout=2.0
+            )
+            outcome["slow_wall"] = time.monotonic() - t0
+
+        def run_normal():
+            outcome["normal"] = reduce_batch(
+                self.baseline, normal_rows, UNIQUE_SQL
+            )
+
+        t1 = threading.Thread(target=run_slow)
+        t2 = threading.Thread(target=run_normal)
+        t1.start(); t2.start(); t1.join(); t2.join()
+
+        self.assertEqual(outcome["slow"].status, "incomplete_timeout")
+        self.assertEqual(outcome["slow"].reduced_rows, [])
+        self.assertEqual(outcome["slow"].target.error_code, 1555)
+        self.assertEqual(outcome["normal"].status, "reduced")
+        self.assertEqual(
+            outcome["normal"].reduced_rows, [("U1", "10"), ("U1", "30")]
+        )
+        # The normal job is unaffected by the slow job's deadline handling.
+        self.assertEqual(outcome["normal"].probe_timeout_count, 0)
+        self.assertBaselineUntouched()
+
+    def test_timeout_leaves_no_probe_process_or_private_copy(self):
+        # The hard deadline is enforced by killing a worker process.  That
+        # worker must be reaped and its private baseline copy removed.
+        import glob as globmod
+
+        before = set(globmod.glob("/tmp/probe_*"))
+        outcome = run_probe(
+            self.baseline, [GLOB_BACKTRACK_ROWS[0]], glob_backtrack_sql(),
+            probe_timeout=2.0,
+        )
+        self.assertEqual(outcome.kind, TIMEOUT)
+        # Give the OS a moment to finish reaping before asserting.
+        time.sleep(0.2)
+        leftover = set(globmod.glob("/tmp/probe_*")) - before
+        self.assertEqual(leftover, set(), f"probe copies leaked: {leftover}")
+        # No probe worker interpreter survives the deadline.
+        ps = subprocess.run(
+            ["ps", "-eo", "args"], capture_output=True, text=True
+        ).stdout
+        self.assertNotIn("probe_worker.py", ps)
         self.assertBaselineUntouched()
 
 

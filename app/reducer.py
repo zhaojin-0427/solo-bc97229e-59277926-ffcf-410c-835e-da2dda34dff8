@@ -15,11 +15,16 @@ Design guarantees required by the specification:
 * Every probe starts from an **independent copy** of the baseline inside a
   private temporary directory. Writes can therefore never reach the
   uploaded baseline or another probe's database.
-* Each probe is limited to ``probe_timeout`` seconds (default 2). Timeouts
-  are enforced by actually terminating the running SQLite statement via
-  ``sqlite3.Connection.interrupt()`` (both a progress-handler and a
-  watchdog thread call it). A timeout is never interpreted as the target
-  error nor as minimality evidence; the reduction is marked incomplete.
+* Each probe is limited to ``probe_timeout`` seconds (default 2) and runs
+  in a **separate worker process**. A progress handler plus
+  ``Connection.interrupt()`` terminate interruptible statements
+  gracefully, but some SQLite work (notably a catastrophic ``GLOB``
+  backtracking match) executes inside one C-level VM opcode and never
+  consults either mechanism. The parent therefore enforces the deadline
+  by killing the worker process (SIGTERM, then SIGKILL), which terminates
+  the actual execution unconditionally, and only then removes the
+  private copy. A timeout is never interpreted as the target error nor
+  as minimality evidence; the reduction is marked incomplete.
 * The result is verified: the reduced batch must reproduce the target
   error, and removing any single remaining row must stop reproducing it.
 """
@@ -27,10 +32,13 @@ Design guarantees required by the specification:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -63,6 +71,7 @@ def validate_sql_script(sql_script: str) -> None:
 ERROR = "error"
 TIMEOUT = "timeout"
 SUCCESS = "success"
+CRASH = "crash"      # worker died/was killed without a result -> inconclusive
 
 # Reduction statuses
 STATUS_REDUCED = "reduced"
@@ -76,12 +85,13 @@ STATUS_FAILED = "failed"
 class ProbeOutcome:
     """Result of one probe (one baseline copy + one script execution)."""
 
-    kind: str                      # ERROR | TIMEOUT | SUCCESS
+    kind: str                      # ERROR | TIMEOUT | SUCCESS | CRASH
     error_code: Optional[int] = None
     error_name: Optional[str] = None
     message: Optional[str] = None
     duration: float = 0.0
     n_rows: int = 0
+    detail: Optional[str] = None   # diagnostic only; never error evidence
 
     @property
     def is_timeout(self) -> bool:
@@ -111,6 +121,10 @@ class ProbeTimeout(Exception):
     """Raised internally when a probe exceeds its time budget."""
 
 
+class ProbeCrash(Exception):
+    """Raised internally when a probe worker dies without a result."""
+
+
 # --- Helpers ----------------------------------------------------------------
 
 def sha256_file(path: str) -> str:
@@ -133,11 +147,102 @@ def is_reproduction(outcome: ProbeOutcome, target: ProbeOutcome) -> bool:
 
 # --- Single probe -----------------------------------------------------------
 
-def run_probe(
+# The probe runs in its own interpreter process.  A catastrophic SQLite
+# match (e.g. GLOB over a long string with a pathologically ambiguous
+# pattern) backtracks inside a *single* C-level VM opcode: the progress
+# handler is never invoked, and Connection.interrupt() only sets a flag
+# that is inspected between opcodes.  Neither can stop that execution.
+# SIGTERM/SIGKILL delivered to the worker process does, unconditionally.
+#
+# A subprocess (rather than multiprocessing ``fork``) is used deliberately:
+# the web layer runs reductions in background threads of a threaded
+# gunicorn worker, and forking from a multi-threaded process can inherit
+# locks held by other threads, stalling the child until it looks like a
+# timeout.  ``spawn``/``forkserver`` instead re-import the host's main
+# module, which gunicorn does not guarantee to be import-safe.  A fresh
+# ``python`` process sidesteps all of it.
+
+_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "probe_worker.py")
+
+
+def _proc_start_time(pid: int) -> Optional[str]:
+    """Kernel start time (field 22 of /proc/<pid>/stat) or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            stat = fh.read().decode("ascii", "replace")
+        # Field 2 (comm) may contain spaces and parentheses.
+        return stat[stat.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _hostname() -> Optional[str]:
+    try:
+        return os.uname().nodename
+    except AttributeError:  # pragma: no cover - non-POSIX fallback
+        return None
+
+
+def _pid_is_alive(pid: int, ident: Optional[dict]) -> bool:
+    """True only when ``pid`` is alive AND still the recorded process.
+
+    Checking the kernel start time guards against PID reuse: a recycled
+    PID belonging to an unrelated process is never signalled.
+    """
+    if ident is None:
+        ident = {}
+    start_time = ident.get("start_time")
+    hostname = ident.get("hostname")
+    if start_time is not None and hostname is not None:
+        if _hostname() != hostname:
+            return False
+        return _proc_start_time(pid) == start_time
+    # No kernel identity available: fall back to liveness only.
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - same-user worker
+        return True
+
+
+def terminate_probe_process(proc: "subprocess.Popen", ident: dict) -> bool:
+    """Terminate the worker's real execution: SIGTERM, then SIGKILL.
+
+    Returns True when a live worker was signalled.  The PID identity is
+    re-verified before each signal, and SIGKILL is used unconditionally
+    after a short grace period, so a statement stuck inside a C-level
+    opcode cannot outlive the deadline.
+    """
+    if proc is None or proc.poll() is not None:
+        return False
+    if not _pid_is_alive(proc.pid, ident):
+        return False
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return False
+    try:
+        proc.wait(timeout=0.25)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    if _pid_is_alive(proc.pid, ident):
+        try:
+            proc.kill()
+        except ProcessLookupError:  # pragma: no cover
+            pass
+    return True
+
+
+def _run_probe_inner(
     baseline_path: str,
     rows: Sequence[Tuple[str, str]],
     sql_script: str,
-    probe_timeout: float = 2.0,
+    probe_timeout: float,
+    workdir: Optional[str] = None,
 ) -> ProbeOutcome:
     """Execute one probe on a fresh, private copy of the baseline.
 
@@ -148,13 +253,18 @@ def run_probe(
       3. execute the deterministic SQL script,
       4. discard the whole temporary directory.
 
-    A statement exceeding ``probe_timeout`` seconds is interrupted; the
-    returned outcome kind is ``timeout``.
+    A statement exceeding ``probe_timeout`` is interrupted when possible;
+    the returned outcome kind is ``timeout``.  (The parent additionally
+    kills this process at the same deadline, which is what actually stops
+    non-interruptible statements.)
     """
     started = time.monotonic()
     n_rows = len(rows)
     validate_sql_script(sql_script)
-    workdir = tempfile.mkdtemp(prefix="probe_")
+    if workdir is None:
+        workdir = tempfile.mkdtemp(prefix="probe_")
+    else:
+        os.makedirs(workdir, exist_ok=True)
     conn: Optional[sqlite3.Connection] = None
     deadline = started + probe_timeout
     state = {"interrupted": False, "timed_out": False}
@@ -178,9 +288,9 @@ def run_probe(
         return sqlite3.SQLITE_OK
 
     def watchdog() -> None:
-        # Belt-and-braces: even if the progress handler is invoked rarely
-        # (e.g. inside a long CTE computation), interrupt() terminates the
-        # statement from another thread at the wall-clock deadline.
+        # Best-effort graceful abort for interruptible statements.  The
+        # parent's SIGTERM/SIGKILL is the real deadline for work that
+        # cannot be interrupted.
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
@@ -270,6 +380,155 @@ def run_probe(
             except sqlite3.Error:
                 pass
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def run_probe(
+    baseline_path: str,
+    rows: Sequence[Tuple[str, str]],
+    sql_script: str,
+    probe_timeout: float = 2.0,
+) -> ProbeOutcome:
+    """Run one probe in a dedicated worker process, with a hard deadline.
+
+    ``probe_timeout`` bounds actual execution: at the deadline the worker
+    is terminated (SIGTERM, then SIGKILL), which stops even SQL that runs
+    inside one non-interruptible C-level opcode.  Its private copy of the
+    baseline is then removed.  A timeout is never treated as the target
+    error nor as minimality evidence.
+    """
+    started = time.monotonic()
+    validate_sql_script(sql_script)
+    # One private directory holds the request, the worker's baseline copy
+    # and its response.  It is removed in `finally`, after the worker has
+    # been waited for -- including the SIGKILL path -- so no probe copy is
+    # ever leaked.
+    private_dir = tempfile.mkdtemp(prefix="probe_")
+    request_path = os.path.join(private_dir, "request.json")
+    response_path = os.path.join(private_dir, "response.json")
+    stderr_path = os.path.join(private_dir, "stderr.log")
+    copy_dir = os.path.join(private_dir, "copy")
+    proc: Optional["subprocess.Popen"] = None
+    ident: Optional[dict] = None
+    try:
+        with open(request_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "baseline_path": baseline_path,
+                    "rows": [list(r) for r in rows],
+                    "sql_script": sql_script,
+                    "probe_timeout": probe_timeout,
+                    "workdir": copy_dir,
+                },
+                fh,
+            )
+
+        with open(stderr_path, "wb") as stderr_fh:
+            proc = subprocess.Popen(
+                [sys.executable, _WORKER_SCRIPT, request_path, response_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_fh,
+                close_fds=True,
+                start_new_session=True,
+            )
+            # Record the kernel identity immediately: it is used to verify
+            # that a PID is still ours before it is signalled.
+            ident = {
+                "pid": proc.pid,
+                "start_time": _proc_start_time(proc.pid),
+                "hostname": _hostname(),
+            }
+            remaining = probe_timeout - (time.monotonic() - started)
+            try:
+                proc.wait(timeout=max(remaining, 0.0))
+            except subprocess.TimeoutExpired:
+                # The worker has NOT produced a result yet.  Terminate it
+                # unconditionally -- this is what stops execution that the
+                # progress handler and interrupt() cannot.  A response
+                # published just before the kill raced with the deadline is
+                # still a legitimate, in-time result, so it is preferred
+                # over reporting a timeout.
+                terminate_probe_process(proc, ident)
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:  # pragma: no cover
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    proc.wait(timeout=0.5)
+                payload = _read_response(response_path)
+                if payload is None:
+                    return ProbeOutcome(
+                        TIMEOUT,
+                        duration=time.monotonic() - started,
+                        n_rows=len(rows),
+                    )
+                return _outcome_from_payload(payload, rows, started)
+
+        payload = _read_response(response_path)
+        if payload is not None:
+            return _outcome_from_payload(payload, rows, started)
+        # The worker exited without publishing a result (crash or external
+        # kill).  Report it as an inconclusive ``crash`` outcome: it must
+        # never be mistaken for the target error, for a timeout, or for
+        # minimality evidence.  The tail of the worker's stderr goes in
+        # ``detail`` (diagnostic only), never in ``message``, which is what
+        # participates in error matching.
+        tail = _tail(stderr_path)
+        return ProbeOutcome(
+            CRASH,
+            duration=time.monotonic() - started,
+            n_rows=len(rows),
+            detail=("probe worker exited without a result"
+                    + (f": {tail}" if tail else "")),
+        )
+    finally:
+        if proc is not None and proc.poll() is None:
+            terminate_probe_process(proc, ident)
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:  # pragma: no cover
+                    pass
+        shutil.rmtree(private_dir, ignore_errors=True)
+
+
+def _outcome_from_payload(
+    payload: dict, rows: Sequence[Tuple[str, str]], started: float
+) -> ProbeOutcome:
+    return ProbeOutcome(
+        kind=payload["kind"],
+        error_code=payload.get("error_code"),
+        error_name=payload.get("error_name"),
+        message=payload.get("message"),
+        duration=payload.get("duration") or (time.monotonic() - started),
+        n_rows=payload.get("n_rows", len(rows)),
+    )
+
+
+def _read_response(path: str) -> Optional[dict]:
+    try:
+        with open(path, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _tail(path: str, limit: int = 2000) -> str:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace").strip()
+    return text[-limit:]
 
 
 # --- Delta debugging --------------------------------------------------------
@@ -421,7 +680,15 @@ def reduce_batch(
     if target.is_timeout:
         result.status = STATUS_INCOMPLETE_TIMEOUT
         result.note = (
-            "完整批次在 2 秒内未执行完，探测已被强制终止；"
+            f"完整批次在 {probe_timeout:g} 秒内未执行完，探测已被强制终止；"
+            "无法确定目标错误，缩减未完成。"
+        )
+        result.finished_at = time.monotonic()
+        return result
+    if target.kind == CRASH:
+        result.status = STATUS_FAILED
+        result.note = (
+            "完整批次的探测进程异常结束，未能得到结果；"
             "无法确定目标错误，缩减未完成。"
         )
         result.finished_at = time.monotonic()
@@ -448,6 +715,14 @@ def reduce_batch(
         )
         result.finished_at = time.monotonic()
         return result
+    if empty.kind == CRASH:
+        result.status = STATUS_FAILED
+        result.note = (
+            "空样本的探测进程异常结束，未能判断错误是否依赖数据行；"
+            "缩减未完成。"
+        )
+        result.finished_at = time.monotonic()
+        return result
     if is_reproduction(empty, target):
         result.status = STATUS_EMPTY_REPRODUCES
         result.note = (
@@ -463,6 +738,8 @@ def reduce_batch(
         outcome = probe(subset)
         if outcome.is_timeout:
             raise ProbeTimeout()
+        if outcome.kind == CRASH:
+            raise ProbeCrash()
         return is_reproduction(outcome, target)
 
     try:
@@ -479,8 +756,16 @@ def reduce_batch(
     except ProbeTimeout:
         result.status = STATUS_INCOMPLETE_TIMEOUT
         result.note = (
-            "缩减过程中有探测超过 2 秒限制，实际执行已被强制终止；"
+            f"缩减过程中有探测超过 {probe_timeout:g} 秒限制，实际执行已被强制终止；"
             "超时不能作为目标错误或最小性证据，本次缩减标记为未完成。"
+        )
+        result.finished_at = time.monotonic()
+        return result
+    except ProbeCrash:
+        result.status = STATUS_FAILED
+        result.note = (
+            "缩减过程中有探测进程异常结束，结果不可靠；"
+            "本次缩减标记为失败，不返回样本。"
         )
         result.finished_at = time.monotonic()
         return result
@@ -488,11 +773,29 @@ def reduce_batch(
     # 4. Final independent confirmation of the returned sample.
     emit("final", "对缩减结果做最终独立复核 …", len(candidate))
     confirm = probe(candidate)
-    if confirm.is_timeout or not is_reproduction(confirm, target):
+    if confirm.kind == CRASH:
+        result.status = STATUS_FAILED
+        result.note = (
+            "最终复核的探测进程异常结束，结果不可靠；不返回缩减样本。"
+        )
+        result.finished_at = time.monotonic()
+        return result
+    if confirm.is_timeout:
         result.status = STATUS_INCOMPLETE_TIMEOUT
         result.note = (
-            "最终复核未能复现目标错误（或复核超时被终止），"
+            "最终复核超时并已被终止，超时不能作为结果证据；"
             "缩减结果不可靠，标记为未完成。"
+        )
+        result.finished_at = time.monotonic()
+        return result
+    if not is_reproduction(confirm, target):
+        # Not a timeout: the candidate genuinely stopped reproducing the
+        # target error.  That is a failed verification, not an incomplete
+        # run, and it is never reported as a reduced sample.
+        result.status = STATUS_FAILED
+        result.note = (
+            "最终复核未能复现目标错误，缩减结果不可靠；"
+            "不返回缩减样本。"
         )
         result.finished_at = time.monotonic()
         return result

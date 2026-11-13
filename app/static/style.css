@@ -94,6 +94,11 @@ button:disabled { background: #9ca3af; cursor: wait; }
 .outcome.success { border-color: #6ee7b7; background: #ecfdf5; }
 .outcome.timeout { border-color: #fcd34d; background: #fffbeb; }
 .outcome code { font-size: 0.88em; }
+.outcome .detail {
+  margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+  background: #0f172a; color: #d7e0ee; font-size: 0.8rem;
+  overflow-x: auto; white-space: pre-wrap;
+}
 
 .event-log {
   max-height: 260px; overflow: auto;

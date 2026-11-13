@@ -68,6 +68,19 @@ WITH RECURSIVE cnt(x) AS (
 SELECT count(*) FROM cnt;
 """
 
+# A legal but pathological GLOB pattern: SQLite's matcher backtracks inside
+# a single C-level VM opcode, so neither a progress handler nor
+# Connection.interrupt() can stop it.  Only the process-level hard deadline
+# (SIGTERM/SIGKILL of the probe worker) bounds actual execution.
+GLOB_BACKTRACK_PATTERN = "*" + "a" * 49000 + "b"
+GLOB_BACKTRACK_SQL = f"""\
+DROP TABLE IF EXISTS result_table;
+CREATE TABLE result_table (sample_id TEXT PRIMARY KEY, reading TEXT);
+INSERT INTO result_table (sample_id, reading)
+SELECT sample_id, reading FROM staging ORDER BY rowid;
+SELECT count(*) FROM result_table WHERE reading GLOB '{GLOB_BACKTRACK_PATTERN}';
+"""
+
 
 def write_baseline(path, seed_default=False):
     if os.path.exists(path):
@@ -126,6 +139,16 @@ def main():
     # 5. Timeout scenario: every probe exceeds the 2-second budget.
     rows5 = [(f"T-{i:03d}", str(i)) for i in range(8)]
     make_scenario("timeout_probe", TIMEOUT_SQL, rows5)
+
+    # 6. Hard-deadline scenario: the full batch already raises a UNIQUE
+    #    error (duplicate sample_id), but a single-row candidate runs a
+    #    non-interruptible GLOB scan.  The probe must be force-terminated
+    #    at 2s; the job is incomplete and keeps the target error.
+    rows6 = [
+        ("S1", "a" * 120000),
+        ("S1", "b" * 120000),
+    ]
+    make_scenario("glob_backtrack", GLOB_BACKTRACK_SQL, rows6)
 
     print("Demo fixtures written under", HERE)
     for name in sorted(os.listdir(HERE)):

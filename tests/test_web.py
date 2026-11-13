@@ -1,7 +1,6 @@
 """End-to-end tests for the Flask web layer."""
 
 import io
-import json
 import os
 import shutil
 import sqlite3
@@ -31,6 +30,22 @@ WITH RECURSIVE cnt(x) AS (
 )
 SELECT count(*) FROM cnt;
 """
+
+# Pathological-but-legal GLOB: SQLite backtracks inside one C-level opcode,
+# so only terminating the worker process enforces the 2s deadline.
+GLOB_BACKTRACK_SQL = """\
+DROP TABLE IF EXISTS result_table;
+CREATE TABLE result_table (sample_id TEXT PRIMARY KEY, reading TEXT);
+INSERT INTO result_table (sample_id, reading)
+SELECT sample_id, reading FROM staging ORDER BY rowid;
+SELECT count(*) FROM result_table
+ WHERE reading GLOB '""" + "*" + "a" * 49000 + "b" + """';
+"""
+
+GLOB_BACKTRACK_ROWS = [
+    ("S1", "a" * 120000),
+    ("S1", "b" * 120000),
+]
 
 
 class WebJobTests(unittest.TestCase):
@@ -137,6 +152,36 @@ class WebJobTests(unittest.TestCase):
         self.assertGreaterEqual(result["probe_timeout_count"], 1)
         self.assertEqual(result["target"]["kind"], "timeout")
 
+    def test_glob_backtrack_timeout_keeps_target_error_and_no_download(self):
+        # Regression for the reported batch: same sample_id -> UNIQUE error
+        # is established on the full batch, then a single-row candidate
+        # runs a non-interruptible GLOB scan.  Actual execution must stop
+        # at the 2s deadline; the job is incomplete, the target error is
+        # retained, and no reduced sample is offered for download.
+        resp = self._submit(GLOB_BACKTRACK_ROWS, sql=GLOB_BACKTRACK_SQL)
+        self.assertEqual(resp.status_code, 201)
+        job_id = resp.get_json()["job_id"]
+        t0 = time.monotonic()
+        data = self._wait(job_id, max_seconds=10)
+        elapsed = time.monotonic() - t0
+
+        result = data["result"]
+        self.assertEqual(result["status"], "incomplete_timeout")
+        self.assertGreaterEqual(result["probe_timeout_count"], 1)
+        self.assertEqual(result["reduced_rows"], [])
+        self.assertEqual(result["reduced_count"], 0)
+        # The target error obtained from the full batch is preserved.
+        self.assertEqual(result["target"]["kind"], "error")
+        self.assertEqual(result["target"]["error_code"], 1555)
+        self.assertIn("未完成", result["note"])
+        # The whole job is bounded by the probe deadline, not by the
+        # ~11s a single unbounded GLOB scan would need.
+        self.assertLess(elapsed, 8.0)
+        # No minimal sample download is exposed.
+        self.assertEqual(
+            self.client.get(f"/api/jobs/{job_id}/download").status_code, 404
+        )
+
     def test_validation_errors(self):
         # wrong header
         bad = io.BytesIO(b"id,val\nA,1\n")
@@ -211,6 +256,32 @@ class WebJobTests(unittest.TestCase):
         self.assertEqual(
             self.client.get("/api/jobs/deadbeef").status_code, 404
         )
+
+    def test_incomplete_timeout_job_still_answers_status_queries(self):
+        # While (and after) a job whose probe must be force-terminated,
+        # status queries and unrelated task submission keep working.
+        slow = self._submit(GLOB_BACKTRACK_ROWS, sql=GLOB_BACKTRACK_SQL)
+        normal = self._submit([("U1", "10"), ("U2", "20"), ("U1", "30")])
+        self.assertEqual(slow.status_code, 201)
+        self.assertEqual(normal.status_code, 201)
+        slow_id = slow.get_json()["job_id"]
+        normal_id = normal.get_json()["job_id"]
+
+        # Poll both concurrently: the slow job is still running its first
+        # (fast) probes while the normal job executes; neither blocks the
+        # other's status endpoint.
+        data_slow = self._wait(slow_id, max_seconds=10)
+        data_normal = self._wait(normal_id, max_seconds=10)
+
+        self.assertEqual(data_slow["result"]["status"], "incomplete_timeout")
+        self.assertEqual(data_slow["result"]["target"]["error_code"], 1555)
+        self.assertEqual(data_normal["result"]["status"], "reduced")
+        self.assertEqual(
+            data_normal["result"]["reduced_rows"], [["U1", "10"], ["U1", "30"]]
+        )
+        self.assertEqual(data_normal["result"]["probe_timeout_count"], 0)
+        # Health/status endpoints remain available throughout.
+        self.assertEqual(self.client.get("/healthz").status_code, 200)
 
 
 if __name__ == "__main__":
