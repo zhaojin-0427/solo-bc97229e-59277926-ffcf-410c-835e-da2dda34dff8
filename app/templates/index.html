@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>仪器 CSV 触发 SQL 错误 · 最小样本缩减</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="container">
+  <header>
+    <h1>仪器 CSV 触发入仓 SQL 错误 · 最小复现样本缩减</h1>
+    <p class="subtitle">
+      上传 SQLite 基线、最多 40 行 CSV（<code>sample_id,reading</code> 两列文本）与确定性 SQL 脚本。
+      每次探测都从独立基线副本开始，单次探测限时 <strong id="timeout-label">2</strong> 秒，
+      超时强制终止且缩减标记为未完成。
+    </p>
+  </header>
+
+  <section id="form-section" class="card">
+    <h2>1. 提交任务</h2>
+    <form id="upload-form">
+      <div class="field">
+        <label for="baseline">SQLite 基线数据库（只读，不会被修改）</label>
+        <input type="file" id="baseline" name="baseline"
+               accept=".db,.sqlite,.sqlite3,.db3" required>
+      </div>
+      <div class="field">
+        <label for="csvfile">CSV 文件（表头 sample_id,reading，至多 40 行数据）</label>
+        <input type="file" id="csvfile" name="csvfile" accept=".csv,text/csv" required>
+      </div>
+      <div class="field">
+        <label for="script">确定性 SQL 脚本（从 staging(sample_id TEXT, reading TEXT) 读取）</label>
+        <input type="file" id="script" name="script" accept=".sql" required>
+      </div>
+      <button type="submit" id="submit-btn">开始缩减</button>
+      <p id="form-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <section id="job-section" class="card" hidden>
+    <h2>2. 缩减进度</h2>
+    <dl class="meta">
+      <dt>任务 ID</dt><dd id="m-job-id">-</dd>
+      <dt>输入行数</dt><dd id="m-input-rows">-</dd>
+      <dt>基线 SHA-256</dt><dd id="m-baseline-hash" class="mono">-</dd>
+      <dt>状态</dt><dd id="m-state">-</dd>
+    </dl>
+
+    <div class="progress-wrap">
+      <div class="progress-bar"><div id="progress-fill"></div></div>
+      <p id="progress-msg" class="progress-msg">等待开始 …</p>
+      <p class="progress-sub">
+        已完成探测 <span id="probe-count">0</span> 次 ·
+        当前候选 <span id="current-size">-</span> 行 ·
+        其中超时 <span id="timeout-count">0</span> 次 ·
+        耗时 <span id="elapsed">0.0</span>s
+      </p>
+    </div>
+
+    <h3>目标错误（原批）</h3>
+    <div id="target-error" class="outcome empty">尚未产生</div>
+
+    <h3>空样本探测</h3>
+    <div id="empty-outcome" class="outcome empty">尚未执行</div>
+
+    <h3>结论</h3>
+    <div id="result-box" class="outcome empty">执行中 …</div>
+
+    <h3>探测日志</h3>
+    <pre id="event-log" class="event-log" aria-live="polite"></pre>
+
+    <div id="download-box" hidden>
+      <h3>3. 下载缩减样本</h3>
+      <a id="download-link" class="button" href="#" download>下载 reduced_sample.csv</a>
+      <h4>样本内容（保持原行序）</h4>
+      <div class="table-wrap">
+        <table id="sample-table">
+          <thead><tr><th>#</th><th>sample_id</th><th>reading</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <p><a href="{{ url_for('index') }}" class="secondary">← 新建任务</a></p>
+  </section>
+
+  <footer>
+    <p>
+      缩减语义：返回样本仍报与原批相同的 SQLite 错误码与消息，
+      且删除其中任意一行后均不再报同一错误。原批成功、或空样本即报同错时只说明原因不缩减。
+    </p>
+  </footer>
+</main>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

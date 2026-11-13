@@ -1,0 +1,24 @@
+services:
+  reducer:
+    build: .
+    image: csv-sql-reducer:latest
+    container_name: csv-sql-reducer
+    ports:
+      - "8000:8000"
+    environment:
+      # 每次探测的硬时限（秒）。超时会真正终止 SQLite 执行。
+      PROBE_TIMEOUT_SECONDS: "2.0"
+      JOBS_DIR: /data/jobs
+    volumes:
+      # 任务产物（上传基线、输入、缩减结果）持久化到宿主机；
+      # 每次探测仍在容器内独立临时目录中进行，结束即删除。
+      - reducer-data:/data/jobs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  reducer-data:
